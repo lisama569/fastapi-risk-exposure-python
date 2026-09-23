@@ -1,0 +1,32 @@
+"""组合门面：统一事件上报、限额校验与情景重算入口。"""
+from __future__ import annotations
+
+from app.limits import LimitChecker
+from app.models import DecisionRecord, ExposureEvent, LimitRule, StressScenario
+from app.store import EventStore
+from app.stress import StressEngine
+
+
+class RiskService:
+    """持有内存状态，向各入口（HTTP/测试）提供一致语义。"""
+
+    def __init__(self) -> None:
+        self.store = EventStore()
+        self.limits = LimitChecker(self.store)
+        self.stress = StressEngine(self.store)
+
+    def set_limit(self, rule: LimitRule) -> None:
+        self.limits.set_limit(rule)
+
+    def submit_event(self, event: ExposureEvent) -> DecisionRecord:
+        """幂等上报并在锁内完成限额校验与提交。"""
+        return self.limits.check_and_commit(event)
+
+    def exposure(self, account_id: str) -> float:
+        return self.store.exposure(account_id)
+
+    def events_of(self, account_id: str):
+        return self.store.events_of(account_id)
+
+    def stress_snapshot(self, scenario: StressScenario) -> dict:
+        return self.stress.snapshot(scenario)
