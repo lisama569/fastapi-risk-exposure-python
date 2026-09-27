@@ -1,10 +1,18 @@
-"""FastAPI 入口：事件上报、限额校验、情景重算的 HTTP 适配层。"""
+"""FastAPI 入口：事件上报、更正、限额校验、情景重算的 HTTP 适配层。"""
 from __future__ import annotations
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from app.models import Decision, ExposureEvent, LimitRule, StressScenario
+from app.models import (
+    CorrectionEvent,
+    Decision,
+    ExposureEvent,
+    GroupLimitRule,
+    LimitRule,
+    StressScenario,
+)
 from app.service import RiskService
 
 app = FastAPI(title="risk-exposure")
@@ -18,6 +26,13 @@ class EventIn(BaseModel):
     delta: float
 
 
+class CorrectionIn(BaseModel):
+    correction_id: str
+    target_event_id: str
+    new_delta: float | None = None
+    cancel: bool = False
+
+
 class LimitIn(BaseModel):
     max_exposure: float
 
@@ -27,12 +42,8 @@ class ScenarioIn(BaseModel):
     shocks: dict[str, float]
 
 
-@app.post("/events")
-def submit_event(body: EventIn):
-    record = service.submit_event(ExposureEvent(**body.model_dump()))
+def _decision_response(record) -> JSONResponse:
     status = 200 if record.decision is not Decision.REJECTED else 409
-    from fastapi.responses import JSONResponse
-
     return JSONResponse(
         status_code=status,
         content={
@@ -43,6 +54,18 @@ def submit_event(body: EventIn):
     )
 
 
+@app.post("/events")
+def submit_event(body: EventIn):
+    return _decision_response(service.submit_event(ExposureEvent(**body.model_dump())))
+
+
+@app.post("/corrections")
+def submit_correction(body: CorrectionIn):
+    return _decision_response(
+        service.submit_correction(CorrectionEvent(**body.model_dump()))
+    )
+
+
 @app.put("/limits/{account_id}")
 def set_limit(account_id: str, body: LimitIn):
     try:
@@ -50,6 +73,29 @@ def set_limit(account_id: str, body: LimitIn):
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
     return {"account_id": account_id, "max_exposure": body.max_exposure}
+
+
+@app.put("/groups/{group_id}/limit")
+def set_group_limit(group_id: str, body: LimitIn):
+    try:
+        service.set_group_limit(GroupLimitRule(group_id, body.max_exposure))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    return {"group_id": group_id, "max_exposure": body.max_exposure}
+
+
+@app.put("/groups/{group_id}/members/{account_id}")
+def assign_member(group_id: str, account_id: str):
+    try:
+        service.assign_account(account_id, group_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    return {"group_id": group_id, "account_id": account_id}
+
+
+@app.get("/groups/{group_id}/usage")
+def group_usage(group_id: str):
+    return service.group_usage(group_id)
 
 
 @app.get("/exposure/{account_id}")

@@ -18,7 +18,10 @@ class RejectReason(str, enum.Enum):
 
     NONE = "NONE"
     LIMIT_EXCEEDED = "LIMIT_EXCEEDED"
+    GROUP_LIMIT_EXCEEDED = "GROUP_LIMIT_EXCEEDED"
     INVALID_EVENT = "INVALID_EVENT"
+    INVALID_CORRECTION = "INVALID_CORRECTION"
+    UNKNOWN_TARGET_EVENT = "UNKNOWN_TARGET_EVENT"
     INVALID_SCENARIO = "INVALID_SCENARIO"
     MISSING_BASELINE = "MISSING_BASELINE"
 
@@ -39,6 +42,30 @@ class LimitRule:
 
     account_id: str
     max_exposure: float
+
+
+@dataclass(frozen=True)
+class GroupLimitRule:
+    """账户组级整体敞口上限（组内所有账户共享）。"""
+
+    group_id: str
+    max_exposure: float
+
+
+@dataclass(frozen=True)
+class CorrectionEvent:
+    """对已生效上报的更正（冲正）。
+
+    - 按 correction_id 幂等去重；按 target_event_id 引用原始上报；
+    - cancel=True 表示整笔撤销（生效 delta 视为 0）；
+    - 否则用 new_delta 替换原始事件的 delta；
+    - cancel 与 new_delta 互斥，二者都缺省视为非法。
+    """
+
+    correction_id: str
+    target_event_id: str
+    new_delta: float | None = None
+    cancel: bool = False
 
 
 @dataclass(frozen=True)
