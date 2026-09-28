@@ -9,7 +9,15 @@ GROUP_LIMIT_EXCEEDED）。账户组敞口 = 组内各账户当前敞口之和。
 
 更正（冲正）：更正按 correction_id 幂等、按 target_event_id 引用原始
 上报；同一目标事件至多被更正一次。更正会改变账户/账户组敞口，
-因此改大金额的更正同样要做两级限额试算，超限即回滚并拒绝。
+因此改大金额的更正同样要做两级限额试算，超限即拒绝。
+
+限额校验的判定边界是“每一个生效时点”，而不是更正后的最新总额：
+更正会追溯替换/抹掉历史事件的生效 delta，必须按更正后的序列重放，
+任一时点（含历史时点与最新时点）账户级或组级累计敞口超过对应上限即
+拒绝。这样“早期上报已通过、后期扣减把敞口拉低、再把早期金额改大到
+超限”的更正无法靠后续扣减“洗白”历史超限口径。试算全程只读（不产生
+已登记的中间状态），通过后才在同一把锁内登记，故不存在“先接受后越限”
+的中间窗口，拒绝也无需回滚。
 """
 from __future__ import annotations
 
@@ -159,8 +167,9 @@ class LimitChecker:
            REJECTED / INVALID_CORRECTION（结论不再确定，必须显式拒绝）；
         3. 目标事件不存在 -> REJECTED / UNKNOWN_TARGET_EVENT；
         4. 目标事件已被其他更正更正过 -> REJECTED / INVALID_CORRECTION；
-        5. 试算后账户级/组级超限 -> 回滚并 REJECTED / 对应原因；
-        6. 否则 ACCEPTED。
+        5. 试算后任一生效时点账户级/组级超限 -> REJECTED / 对应原因
+           （试算只读，登记状态从未改变，无需回滚）；
+        6. 否则登记更正并 ACCEPTED。
         """
         with self._lock:
             invalid = self._validate_correction(corr)
@@ -188,39 +197,61 @@ class LimitChecker:
                     Decision.REJECTED, RejectReason.INVALID_CORRECTION,
                     f"事件 {corr.target_event_id} 已被更正过，不接受第二条更正",
                 )
-            # 试算：先应用更正重算敞口，任一级超限即回滚
-            self._store.add_correction(corr)
-            breach = self._limit_breach_record(target.account_id)
+            # 只读试算：在逐生效时点路径上检查两级限额，任一点超限即拒绝
+            trial_delta = 0.0 if corr.cancel else corr.new_delta
+            breach = self._historical_breach_record(
+                target.account_id, {corr.target_event_id: trial_delta}
+            )
             if breach is not None:
-                self._store.remove_correction(corr.correction_id)
                 return breach
+            self._store.add_correction(corr)
             return DecisionRecord(
                 Decision.ACCEPTED, RejectReason.NONE,
                 f"更正 {corr.correction_id} 已生效，账户 {target.account_id} 当前敞口 "
                 f"{self._store.exposure(target.account_id)}",
             )
 
-    def _limit_breach_record(self, account_id: str) -> DecisionRecord | None:
-        """检查账户当前敞口是否越过账户级/组级上限（更正试算用）。"""
-        exposure = self._store.exposure(account_id)
+    def _historical_breach_record(
+        self,
+        account_id: str,
+        overrides: dict[str, float],
+    ) -> DecisionRecord | None:
+        """试算更正后账户在每一个生效时点是否越过账户级/组级上限。
+
+        逐点检查而非只看最新总额：更正追溯改写历史事件的生效 delta，
+        即使后续扣减使最新总额回落到上限内，历史生效时点的超限同样拒绝。
+        判定层级与事件提交一致：账户级放不下优先 LIMIT_EXCEEDED，
+        账户级通过后组级任一点放不下为 GROUP_LIMIT_EXCEEDED。
+        """
         rule = self._rules.get(account_id)
-        if rule is not None and exposure > rule.max_exposure:
-            return DecisionRecord(
-                Decision.REJECTED, RejectReason.LIMIT_EXCEEDED,
-                f"更正后账户 {account_id} 敞口 {exposure} 超过账户级上限 "
-                f"{rule.max_exposure}，更正已回滚",
-            )
+        if rule is not None:
+            path = self._store.effective_path(account_id, overrides)
+            latest = path[-1][1] if path else 0.0
+            for ev, total in path:
+                if total > rule.max_exposure:
+                    return DecisionRecord(
+                        Decision.REJECTED, RejectReason.LIMIT_EXCEEDED,
+                        f"更正后账户 {account_id} 在生效事件 {ev.event_id} 时点敞口 "
+                        f"{total} 超过账户级上限 {rule.max_exposure}（即使更正后最新"
+                        f"总额 {latest} 未超限，历史时点超限仍拒绝），更正未生效",
+                    )
         group_id = self._membership.get(account_id)
         if group_id is not None:
             group_rule = self._group_rules.get(group_id)
             if group_rule is not None:
-                group_exposure = self.group_exposure(group_id)
-                if group_exposure > group_rule.max_exposure:
-                    return DecisionRecord(
-                        Decision.REJECTED, RejectReason.GROUP_LIMIT_EXCEEDED,
-                        f"更正后账户组 {group_id} 敞口 {group_exposure} 超过组级上限 "
-                        f"{group_rule.max_exposure}，更正已回滚",
-                    )
+                members = self.group_members(group_id)
+                overrides_by_account = {account_id: overrides}
+                for owner, ev, group_total in self._store.group_effective_path(
+                    members, overrides_by_account
+                ):
+                    if group_total > group_rule.max_exposure:
+                        return DecisionRecord(
+                            Decision.REJECTED, RejectReason.GROUP_LIMIT_EXCEEDED,
+                            f"更正后账户组 {group_id} 在账户 {owner} 生效事件 "
+                            f"{ev.event_id} 时点共享敞口 {group_total} 超过组级上限 "
+                            f"{group_rule.max_exposure}（最新总额未超限亦拒绝），"
+                            f"更正未生效",
+                        )
         return None
 
     # ---- 校验 ----

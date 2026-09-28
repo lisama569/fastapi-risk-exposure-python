@@ -8,6 +8,12 @@
 撤销类更正视为 0，改值类更正用 new_delta 替换原 delta。
 更正按 correction_id 幂等去重，且每个目标事件至多被更正一次，
 因此最终敞口是 {事件集合, 更正集合} 的确定性函数，与到达顺序无关。
+
+更正限额校验需要检查“每一个生效时点”而非只看最新总额：exposure 只给出
+序列终点，effective_path / group_effective_path 额外给出逐步累加的中间
+敞口（含终点）。两者都支持 overrides 试算参数
+（target_event_id -> 生效 delta），试算只读、绝不改动已登记状态，
+因此被拒更正不存在任何“先生效、后越限”的中间窗口，也无需回滚。
 """
 from __future__ import annotations
 
@@ -65,14 +71,14 @@ class EventStore:
             )
             return True
 
-    def remove_correction(self, correction_id: str) -> None:
-        """撤销已登记更正（仅供提交入口在限额试算失败时回滚）。"""
-        with self._lock:
-            corr = self._corrections.pop(correction_id, None)
-            if corr is not None:
-                self._correction_by_target.pop(corr.target_event_id, None)
-
-    def _effective_delta(self, event: ExposureEvent) -> float:
+    def _resolved_delta(
+        self,
+        event: ExposureEvent,
+        overrides: dict[str, float] | None = None,
+    ) -> float:
+        """事件的生效 delta；overrides（试算更正）优先于已登记更正。"""
+        if overrides is not None and event.event_id in overrides:
+            return overrides[event.event_id]
         corr = self.correction_for_target(event.event_id)
         if corr is None:
             return event.delta
@@ -80,6 +86,59 @@ class EventStore:
             return 0.0
         assert corr.new_delta is not None  # 合法性由提交入口保证
         return corr.new_delta
+
+    def effective_path(
+        self,
+        account_id: str,
+        overrides: dict[str, float] | None = None,
+    ) -> list[tuple[ExposureEvent, float]]:
+        """逐生效时点返回 (事件, 截至该事件的累计敞口)，负值处截断为 0。
+
+        末项的累计敞口即 exposure(account_id)；中间项即各历史生效时点的
+        敞口，供更正限额校验逐点检查。overrides 仅用于只读试算。
+        """
+        with self._lock:
+            path: list[tuple[ExposureEvent, float]] = []
+            total = 0.0
+            for ev in self._ordered(account_id):
+                total = max(0.0, total + self._resolved_delta(ev, overrides))
+                path.append((ev, total))
+            return path
+
+    def group_effective_path(
+        self,
+        account_ids: list[str],
+        overrides_by_account: dict[str, dict[str, float]] | None = None,
+    ) -> list[tuple[str, ExposureEvent, float]]:
+        """账户组在全局生效时序下的逐点 (账户, 事件, 组累计敞口)。
+
+        把组内各账户的有序事件流按 (seq, account_id, event_id) 确定性合并；
+        每步在事件所属账户上累加其生效 delta（该账户负值截断为 0），
+        组累计 = 当时各账户累计之和。末项即组当前敞口，中间项即各历史
+        生效时点的组敞口。试算覆盖按账户分桶传入，只读不改状态。
+        """
+        with self._lock:
+            merged: list[tuple[str, ExposureEvent]] = []
+            for account_id in account_ids:
+                for ev in self._ordered(account_id):
+                    merged.append((account_id, ev))
+            merged.sort(key=lambda x: (x[1].seq, x[0], x[1].event_id))
+            running: dict[str, float] = {a: 0.0 for a in account_ids}
+            path: list[tuple[str, ExposureEvent, float]] = []
+            for account_id, ev in merged:
+                overrides = (
+                    overrides_by_account.get(account_id)
+                    if overrides_by_account is not None else None
+                )
+                running[account_id] = max(
+                    0.0,
+                    running[account_id] + self._resolved_delta(ev, overrides),
+                )
+                path.append((account_id, ev, sum(running.values())))
+            return path
+
+    def _effective_delta(self, event: ExposureEvent) -> float:
+        return self._resolved_delta(event)
 
     def _ordered(self, account_id: str) -> list[ExposureEvent]:
         bucket = self._events.get(account_id, {})

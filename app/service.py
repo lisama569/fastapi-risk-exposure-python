@@ -40,7 +40,7 @@ class RiskService:
         return self.limits.check_and_commit(event)
 
     def submit_correction(self, correction: CorrectionEvent) -> DecisionRecord:
-        """幂等提交更正（冲正），必要时做限额试算与回滚。"""
+        """幂等提交更正（冲正），只读试算逐生效时点限额，通过后才登记。"""
         return self.limits.check_and_commit_correction(correction)
 
     # ---- 查询 ----
