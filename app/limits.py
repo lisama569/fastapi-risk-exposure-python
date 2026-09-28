@@ -8,8 +8,10 @@
 GROUP_LIMIT_EXCEEDED）。账户组敞口 = 组内各账户当前敞口之和。
 
 更正（冲正）：更正按 correction_id 幂等、按 target_event_id 引用原始
-上报；同一目标事件至多被更正一次。更正会改变账户/账户组敞口，
-因此改大金额的更正同样要做两级限额试算，超限即回滚并拒绝。
+上报；同一目标事件至多被更正一次。更正会改变历史事件的生效 delta，
+因此不能只校验“更正后的最新总敞口”：只要更正后的生效轨迹在任一时点
+（账户层）或任一可能的生效交错时点（账户组层）越过上限，即使最新总额
+已被后续扣减拉回上限内，也必须整体回滚并以对应层级原因拒绝。
 """
 from __future__ import annotations
 
@@ -26,6 +28,14 @@ from app.models import (
     RejectReason,
 )
 from app.store import EventStore
+
+# 浮点比较容差：恰好等于上限视为放得下
+_EPS = 1e-9
+
+
+def _fmt(value: float) -> str:
+    """判定明细里的金额格式化，去掉浮点尾差（如 80.00000000000001）。"""
+    return f"{round(value, 6):g}"
 
 
 class LimitChecker:
@@ -159,7 +169,8 @@ class LimitChecker:
            REJECTED / INVALID_CORRECTION（结论不再确定，必须显式拒绝）；
         3. 目标事件不存在 -> REJECTED / UNKNOWN_TARGET_EVENT；
         4. 目标事件已被其他更正更正过 -> REJECTED / INVALID_CORRECTION；
-        5. 试算后账户级/组级超限 -> 回滚并 REJECTED / 对应原因；
+        5. 试算后账户级/组级在任一历史生效时点超限（即使最新总额已回落）
+           -> 回滚并 REJECTED / 对应原因；
         6. 否则 ACCEPTED。
         """
         with self._lock:
@@ -188,9 +199,12 @@ class LimitChecker:
                     Decision.REJECTED, RejectReason.INVALID_CORRECTION,
                     f"事件 {corr.target_event_id} 已被更正过，不接受第二条更正",
                 )
-            # 试算：先应用更正重算敞口，任一级超限即回滚
+            # 试算：先记录更正前基线轨迹峰值，再应用更正逐时点校验两级
+            # 限额。只有“更正把历史时点抬过上限”才拒绝并回滚；调小/撤销
+            # 只会逐时点压低轨迹，绝不误伤；历史口径与最新敞口都不变。
+            baseline = self._trajectory_peaks(target.account_id)
             self._store.add_correction(corr)
-            breach = self._limit_breach_record(target.account_id)
+            breach = self._correction_breach_record(target.account_id, baseline)
             if breach is not None:
                 self._store.remove_correction(corr.correction_id)
                 return breach
@@ -200,28 +214,116 @@ class LimitChecker:
                 f"{self._store.exposure(target.account_id)}",
             )
 
-    def _limit_breach_record(self, account_id: str) -> DecisionRecord | None:
-        """检查账户当前敞口是否越过账户级/组级上限（更正试算用）。"""
-        exposure = self._store.exposure(account_id)
+    def _trajectory_peaks(self, account_id: str) -> tuple[float, float | None]:
+        """记录更正前的轨迹峰值：(账户层逐时点峰值, 组层最小可达峰值或 None)。
+
+        组层只在账户归属了已配置上限的组时计算。
+        """
+        account_peak = max(self._store.effective_path(account_id), default=0.0)
+        group_id = self._membership.get(account_id)
+        group_peak: float | None = None
+        if group_id is not None and group_id in self._group_rules:
+            group_peak = self._group_peak_exposure(group_id)
+        return account_peak, group_peak
+
+    def _correction_breach_record(
+        self, account_id: str, baseline: tuple[float, float | None]
+    ) -> DecisionRecord | None:
+        """更正试算：逐时点校验账户层、再校验账户组层历史轨迹。
+
+        判定边界——把更正后的轨迹峰值与上限、更正前基线峰值同时比较：
+        - 第一层（账户级）：更正后账户按序去重的每个生效时点敞口都不得
+          *超过账户上限且高于基线峰值*。后续扣减把最新总额拉回上限内，
+          不能洗白更正把某个历史时点抬过账户上限的事实；而调小/撤销只会
+          逐时点压低轨迹，峰值不增，不会被误伤。
+        - 第二层（账户组级）：组内各账户的事件可交错生效，按“可交错但
+          每账户保序”计算组共享敞口的最小可达峰值；若该峰值被更正抬过
+          组上限，则任何交错顺序都必然在某个时点超限，拒绝；存在全程不
+          超限的交错顺序（含最终确实不超限）则接受。
+        """
+        base_account_peak, base_group_peak = baseline
         rule = self._rules.get(account_id)
-        if rule is not None and exposure > rule.max_exposure:
-            return DecisionRecord(
-                Decision.REJECTED, RejectReason.LIMIT_EXCEEDED,
-                f"更正后账户 {account_id} 敞口 {exposure} 超过账户级上限 "
-                f"{rule.max_exposure}，更正已回滚",
-            )
+        if rule is not None:
+            for point in self._store.effective_path(account_id):
+                if point > rule.max_exposure + _EPS and point > base_account_peak + _EPS:
+                    return DecisionRecord(
+                        Decision.REJECTED, RejectReason.LIMIT_EXCEEDED,
+                        f"更正后账户 {account_id} 在某生效时点的敞口 {_fmt(point)} "
+                        f"超过账户级上限 {rule.max_exposure}（即使最新总额已回落），"
+                        f"更正已回滚",
+                    )
         group_id = self._membership.get(account_id)
         if group_id is not None:
             group_rule = self._group_rules.get(group_id)
             if group_rule is not None:
-                group_exposure = self.group_exposure(group_id)
-                if group_exposure > group_rule.max_exposure:
+                peak = self._group_peak_exposure(group_id)
+                raised = base_group_peak is None or peak > base_group_peak + _EPS
+                if raised and peak > group_rule.max_exposure + _EPS:
                     return DecisionRecord(
                         Decision.REJECTED, RejectReason.GROUP_LIMIT_EXCEEDED,
-                        f"更正后账户组 {group_id} 敞口 {group_exposure} 超过组级上限 "
-                        f"{group_rule.max_exposure}，更正已回滚",
+                        f"更正后账户组 {group_id} 在某生效时点的共享敞口 "
+                        f"{_fmt(peak)} 超过组级上限 {group_rule.max_exposure}"
+                        f"（即使最新总额已回落），更正已回滚",
                     )
         return None
+
+    def _group_peak_exposure(self, group_id: str) -> float:
+        """组内各账户步长在“可交错但每账户保序”前提下，组共享敞口的最小
+        可达峰值（分支限界精确求解，不是启发式）。
+
+        - 每个账户按自身步长独立做 0 截断，得到逐账户状态序列；交错只影响
+          跨账户时点，每账户内部顺序固定；
+        - 状态 = 各账户“已走到第几步”的位置向量（位置即决定该账户当前敞口，
+          与到达路径无关，故同位置向量只探索一次）；
+        - 每步推进一个账户，组总额 = 各账户当前状态之和，记录路径峰值；
+          用优先队列按“当前峰值、当前总额”扩展，第一次到达终点即最小可达
+          峰值。该峰值 <= 组上限，当且仅当存在全程不超限的交错顺序。
+        """
+        import heapq
+
+        members = self.group_members(group_id)
+        queues: list[list[float]] = []
+        for member in members:
+            states: list[float] = []
+            total = 0.0
+            for delta in self._store.effective_deltas(member):
+                total = max(0.0, total + delta)
+                states.append(total)
+            queues.append(states)
+        sizes = tuple(len(q) for q in queues)
+        if not sizes or all(n == 0 for n in sizes):
+            return 0.0
+
+        def total_at(positions: tuple[int, ...]) -> float:
+            total = 0.0
+            for i, p in enumerate(positions):
+                if p > 0:
+                    total += queues[i][p - 1]
+            return total
+
+        start = (0,) * len(queues)
+        goal = sizes
+        # 堆元素：(路径峰值, 当前总额, 位置向量)
+        heap: list[tuple[float, float, tuple[int, ...]]] = [(0.0, 0.0, start)]
+        seen: set[tuple[int, ...]] = {start}
+        while heap:
+            peak, current, positions = heapq.heappop(heap)
+            if positions == goal:
+                return peak
+            for i, n in enumerate(sizes):
+                if positions[i] >= n:
+                    continue
+                next_positions = positions[:i] + (positions[i] + 1,) + positions[i + 1:]
+                if next_positions in seen:
+                    continue
+                seen.add(next_positions)
+                state_i = queues[i][positions[i]]  # 推进后账户 i 的状态
+                next_total = current - (
+                    queues[i][positions[i] - 1] if positions[i] > 0 else 0.0
+                ) + state_i
+                next_peak = max(peak, next_total)
+                heapq.heappush(heap, (next_peak, next_total, next_positions))
+        return 0.0  # 理论不可达：堆空意味着无状态可扩展
 
     # ---- 校验 ----
 

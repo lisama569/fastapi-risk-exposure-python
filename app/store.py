@@ -88,10 +88,32 @@ class EventStore:
     def exposure(self, account_id: str) -> float:
         """按序去重聚合敞口（应用更正后的生效 delta），负值处截断为 0。"""
         with self._lock:
+            return self._exposure_locked(account_id)
+
+    def _exposure_locked(self, account_id: str) -> float:
+        total = 0.0
+        for ev in self._ordered(account_id):
+            total = max(0.0, total + self._effective_delta(ev))
+        return total
+
+    def effective_deltas(self, account_id: str) -> list[float]:
+        """返回账户按序去重后每笔事件的生效 delta（更正后口径）。"""
+        with self._lock:
+            return [self._effective_delta(ev) for ev in self._ordered(account_id)]
+
+    def effective_path(self, account_id: str) -> list[float]:
+        """返回账户按序去重后每个生效时点的敞口（含 0 截断）。
+
+        更正会改写历史事件的生效 delta，因此不能只看最终敞口：
+        限额试算必须逐时点检查更正后的整条轨迹，任何一个时点超限都算放不下。
+        """
+        with self._lock:
+            path: list[float] = []
             total = 0.0
             for ev in self._ordered(account_id):
                 total = max(0.0, total + self._effective_delta(ev))
-            return total
+                path.append(total)
+            return path
 
     def accounts(self) -> list[str]:
         with self._lock:
